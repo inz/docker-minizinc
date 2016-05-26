@@ -1,0 +1,68 @@
+#!/usr/bin/env ruby
+
+require 'json'
+require 'open-uri'
+
+FEED_URL = 'https://api.github.com/repos/MiniZinc/libminizinc/releases'
+BASE_IMAGE = 'alpine:3.3'
+MAINTAINER = 'Christian Inzinger <christian@inz.io>'
+IMAGE_NAMESPACE = 'inzinger'
+IMAGE_BASENAME = 'minizinc'
+
+IMAGE_NAME = "#{IMAGE_NAMESPACE}/#{IMAGE_BASENAME}"
+
+puts 'Fetching releases...'
+releases_feed = JSON.load(open(FEED_URL))
+latest_version = nil
+
+# Get download URLs for all tagged releases
+releases = releases_feed.inject({}) do |result, entry|
+  # Only select assets build for 64-bit Linux.
+  asset = entry['assets'].find { |a| a['name'] =~ /linux64/ }
+  asset_version = entry['tag_name']
+  # The first release we see should be the latest version.
+  # (The GitHub API does not actually specify if this is the case, so YMMV!)
+  latest_version ||= asset_version
+  result.merge!(asset_version => asset['browser_download_url']) rescue result
+end
+
+releases.each do |version, asset_url|
+  puts "Creating Dockerfile for version #{version}..."
+  
+  asset_filename = File.basename(asset_url)
+  dockerfile = <<-EOD
+FROM #{BASE_IMAGE}
+
+MAINTAINER #{MAINTAINER}
+
+RUN apk --update add --virtual build-deps \\
+      openssl \\
+    && cd /usr/local \\
+    && wget -O #{asset_filename} #{asset_url} \\
+    && tar xfz #{asset_filename} \\
+    && cp minizinc-#{version}/bin/* bin/ \\
+    && cp -ra minizinc-#{version}/share/* share/ \\
+    && rm -rf minizinc-* \\
+    && apk del build-deps \\
+    && rm -rf /var/cache/apk/*
+
+  EOD
+
+  image_tag = "#{IMAGE_NAME}:#{version}"
+  puts "Building image for #{version} using Dockerfile:"
+  puts dockerfile
+  IO.popen("docker build --tag #{image_tag} -", "r+") do |cmd|
+    cmd.print dockerfile
+    cmd.close_write
+    cmd.each { |line| puts line }
+  end
+  puts "Pushing image to Docker Hub..."
+  system("docker push #{image_tag}")
+end
+
+puts "Tagging #{latest_version} as latest..."
+system("docker tag #{IMAGE_NAME}:#{latest_version} #{IMAGE_NAME}:latest")
+puts "Pushing image to Docker Hub"
+system("docker push #{IMAGE_NAME}:latest")
+
+puts 'Done.'
